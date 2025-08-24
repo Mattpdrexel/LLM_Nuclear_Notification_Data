@@ -1,0 +1,72 @@
+# Python 3.11.9 environment
+# This file is annotated for clarity. Lines starting with `#` are comments and safe to leave as-is.
+#
+# CUDA + PyTorch note:
+# - Your NVIDIA driver reports support up to CUDA 12.8.
+# - PyTorch publishes official wheels for specific minors (e.g., cu121, cu124). Use cu124.
+# - These wheels are backward-compatible with newer drivers.
+
+
+# .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# & c:/Users/mattp/Desktop/Code/Python/Projects/LLM_Nuclear_Notification_Data/.venv/Scripts/Activate.ps1
+# pip install --no-cache-dir torch==2.7.0+cu126 torchvision==0.22.0+cu126 torchaudio==2.7.0+cu126 --extra-index-url https://download.pytorch.org/whl/cu126
+
+
+# Use the PyTorch CUDA 12.6 wheel index for the following three packages
+--index-url https://download.pytorch.org/whl/cu126
+
+# Core deep learning stack (GPU-enabled). These will be installed from the index above.
+torch==2.7.0+cu126            # PyTorch core (CUDA 12.6 build)
+torchvision==0.22.0+cu126     # Computer vision models and image utilities
+torchaudio==2.7.0+cu126       # Audio models and utilities
+xformers==0.0.30              # Faster inference with attention mechanisms
+transformers                  # Hugging Face transformer models
+
+# Reset index back to PyPI for everything else
+--index-url https://pypi.org/simple
+
+# ------------------------------------------------------------
+# Optional: productivity and data science packages
+# Uncomment as needed
+# ------------------------------------------------------------
+
+# jupyterlab      # Notebook IDE
+# ipywidgets      # Interactive widgets in notebooks
+
+# numpy           # N-dimensional arrays and math
+# pandas          # DataFrames and data wrangling
+# scipy           # Scientific computing utilities
+# scikit-learn    # Classical ML algorithms and tools
+
+# transformers    # Hugging Face transformer models
+# tokenizers      # Fast tokenization (Rust-backed)
+# sentencepiece   # Tokenizer for many multilingual models
+
+# matplotlib      # Plotting library
+# seaborn         # Statistical data visualization
+
+# python-dotenv   # Load environment variables from .env
+# tqdm            # Progress bars
+# rich            # Rich text and tracebacks in the terminal
+
+
+# Test and HTTP clients
+pytest
+requests
+
+# Model download and inference
+transformers
+huggingface_hub
+accelerate
+safetensors
+bitsandbytes
+
+# Data processing and embeddings
+pandas
+openpyxl
+sentence-transformers
+scikit-learn
+numpy
+# For BAAI/bge-m3 (downloads via HF, no extra deps needed beyond transformers & sentence-transformers)
+

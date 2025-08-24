@@ -1,0 +1,70 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.build/
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Unit test / coverage
+.pytest_cache/
+.coverage*
+htmlcov/
+.tox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project-specific artifacts
+embeddings_cache/
+outputs/
+models/
+
+# Raw data (keep small metadata files tracked)
+# Ignore large/lossy binary sources; allow curated text/json
+raw_data/**/*.xlsx
+raw_data/**/*.xls
+raw_data/**/*.csv
+raw_data/**/*.pdf
+raw_data/**/*.doc
+raw_data/**/*.docx
+# Allow seed/config/context text files
+!raw_data/**/*.txt
+!raw_data/**/*.json
+
+# Checkpoints / temporary files
+*.ckpt
+*.tmp
+*.bak
+*.swp
