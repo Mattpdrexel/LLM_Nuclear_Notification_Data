@@ -17,7 +17,7 @@ CONFIG = {
 
     # Dynamic sampling-driven generation
     "SAMPLES_PER_RUN": 50,
-    "SNIPPET_NUM_CHUNKS": 1,
+    "SNIPPET_NUM_CHUNKS": 2,
     "SNIPPET_CHAR_BUDGET": 3000,
 
     # Retrieval around identified subject
@@ -29,8 +29,8 @@ CONFIG = {
     "MODEL_DIR": r"D:\huggingface\hub\Qwen2.5-32B-Instruct-bnb-4bit",
     "DEVICE_MAP": "balanced",
     "GPU_MAX_MEMORY_GIB": 19,
-    "MAX_INPUT_TOKENS": 2048,
-    "MAX_NEW_TOKENS": 800,
+    "MAX_INPUT_TOKENS": 4000,
+    "MAX_NEW_TOKENS": 1000,
     "TEMPERATURE": 0.2,
     "TOP_P": 0.9,
 }
@@ -158,7 +158,11 @@ def ask_for_qa_json(blocks: List[str], seeds_examples: str, tok, model,
         f"# ─── Context Notifications ─────────────────────────────\n{context}\n\n"
         "# ─── Your Task ─────────────────────────────────────────\n"
         "Write one highly insightful, grounded question about the context, then answer it concisely.\n"
-        "Question should be a generic one that does not refer explicitly to the context, but rather to a general concept or issue that is relevant to the context.\n"
+        "Don't make question overly specific to one detail of a single notification.\n"
+        "Question should be specific to the systems or components in the context.\n"
+        "Question should not be focused on only a single notification.\n"
+        "Answer should use the context as supporting evidence to answer the question.\n"
+        "Ensure references are unique and not repeated.\n"
         "Return strictly valid JSON with keys \"question\", \"answer\", and \"references\" (list of [REF x] strings you used)."
     )
     if hasattr(tok, "apply_chat_template"):
@@ -204,7 +208,8 @@ def ask_for_draft_question(blocks: List[str], seeds_examples: str, tok, model,
     user = (
         f"# ─── Context Notifications ─────────────────────────────\n{context}\n\n"
         "# ─── Your Task ─────────────────────────────────────────\n"
-        "Write one single-sentence, highly insightful and grounded question that a domain engineer would ask based on this context. Question scope should be limited to the context provided, or reasonably inferred from the context.\n"
+        "Write one single-sentence, highly insightful and grounded question that a domain engineer would ask based on this context. \n"
+        "Question should be specific to the systems or components in the context.\n"
         "Return ONLY the question text with no extra words or formatting."
     )
     if hasattr(tok, "apply_chat_template"):
@@ -298,11 +303,10 @@ def main():
 
     results: List[Dict[str, Any]] = []
 
-    # Prepare output files upfront
+    # Prepare output file upfront
     out_dir = ensure_outputs_dir(cfg["OUTPUTS_DIR"])
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_file_json = out_dir / f"qa_generated_{ts}.json"
-    out_file_jsonl = out_dir / f"qa_generated_{ts}.jsonl"
 
     for sample_idx in range(cfg.get("SAMPLES_PER_RUN", 3)):
         # Step 1: Draft question from random complete notifications
@@ -348,17 +352,15 @@ def main():
         }
         results.append(record)
 
-        # Incremental checkpointing: append JSONL and write partial JSON
+        # Incremental checkpointing: write partial JSON after each iteration
         try:
-            with open(out_file_jsonl, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
             with open(out_file_json, "w", encoding="utf-8") as f:
                 json.dump({"config": cfg, "results": results, "generated_at": datetime.now().isoformat()}, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
     # Final message
-    print(f"Saved results to: {out_file_json} and JSONL stream at: {out_file_jsonl}")
+    print(f"Saved results to: {out_file_json}")
 
 
 if __name__ == "__main__":
