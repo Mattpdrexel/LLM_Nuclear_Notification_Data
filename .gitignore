@@ -71,3 +71,4 @@ raw_data/*.txt
 # Sensitive raw seeds and training docs (override earlier whitelists)
 raw_data/seeds.json
 raw_data/cw_training.txt
+Fine_Tuning/too_long_examples.json
