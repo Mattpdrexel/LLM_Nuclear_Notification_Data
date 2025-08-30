@@ -1,39 +1,38 @@
-# train_qlora_context_full.py
-# QLoRA fine-tune with FULL notification context (no truncation). If a sample
-# exceeds MAX_LENGTH, we DO NOT trim — we report and (by default) ERROR so you
-# can manually adjust TOP_K or edit the long samples.
-
 import os
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+import re
 
 import torch
 from datasets import Dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-)
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
-from sentence_transformers import SentenceTransformer
 import numpy as np
 
-
 # ======================= Config =======================
-BASE_MODEL_DIR = r"D:\huggingface\hub\Qwen2.5-7B-Instruct-bnb-4bit"  # 4-bit base for QLoRA
+BASE_MODEL_DIR = r"D:\huggingface\hub\Qwen2.5-7B-Instruct-bnb-4bit"
 
-DATA_FILES: List[str] = [
-    "outputs/qa_generated_for_fine_tuning.json",
-    "outputs/idk_generated_for_fine_tuning.json",
-]
+# Train on ONE file only (your QA set)
+DATA_FILE = "outputs/qa_generated_for_fine_tuning.json"
 
-EMBEDDINGS_PATH = "embeddings_cache/nuclear_notifications_embeddings.pkl"  # to rebuild contexts if refs missing
+# We only use stored refs; needed to reconstruct full notifications
+EMBEDDINGS_PATH = "embeddings_cache/nuclear_notifications_embeddings.pkl"
 
 OUTPUT_DIR = "Fine_Tuning/checkpoints/qwen2_5_7b_qlora_ctx_full"
-MAX_LENGTH = 5000
+SYSTEM_PROMPT = "You are a helpful domain expert assistant for nuclear plant notifications."
 
+# We do NOT truncate. If a sample is too long, we skip (or error).
+MAX_SEQ_TOKENS = 10000
+OVERFLOW_POLICY = "error"  # "error" or "skip"
+OVERFLOW_REPORT = "Fine_Tuning/too_long_examples.json"
+
+# Limit how many notifications/refs we include per example, independent of token budget
+REF_TOP_K = 4  # set to 3 or 4 as desired
+DEDUP_BY_NOTIFICATION = True  # collapse multiple chunks from the same notification id
+
+# Training knobs (safer for 2x20GB with long contexts)
 BATCH_SIZE = 1
 GRAD_ACCUM = 32
 NUM_EPOCHS = 3
@@ -43,62 +42,41 @@ WARMUP_RATIO = 0.03
 SAVE_STEPS = 1000
 SAVE_TOTAL_LIMIT = 3
 LOGGING_STEPS = 25
-PACKING = False  # keep off for simplicity with long contexts
+PACKING = False
 SEED = 42
 
-SYSTEM_PROMPT = "You are a helpful domain expert assistant for nuclear plant notifications."
+# Use both GPUs for capacity (model sharded)
+GPU_MAX_MEMORY_GIB = 19  # per GPU cap
 
-# IMPORTANT: We keep FULL notifications (no truncation). If too long, we error/skip.
-TOP_K = 4                       # number of notifications to retrieve per example (adjust manually)
-OVERFLOW_POLICY = "error"       # "error" or "skip"
-OVERFLOW_REPORT = "Fine_Tuning/too_long_examples.json"
-
-# Treat these as "unanswerable" signals to use EMPTY context
-REFUSAL_MATCH = (
-    "do not contain enough information",
-    "insufficient information",
-    "cannot answer with the provided context",
-)
-
-# GPU usage
-MULTI_GPU = True                # set True to shard the model across all visible GPUs
-GPU_MAX_MEMORY_GIB = 19         # per-GPU memory cap for sharding
-
-
-# ======================= Utils =======================
+# ======================= Helpers =======================
 def assert_cuda():
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required. No torch.cuda device found.")
-    print(f"[GPU] Using device: {torch.cuda.get_device_name(0)}")
+        raise RuntimeError("CUDA GPU is required.")
+    print(f"[GPU] Visible devices: {torch.cuda.device_count()} | 0={torch.cuda.get_device_name(0)}")
 
-
-def load_embeddings_matrix(path: str) -> Tuple[np.ndarray, List[Dict[str, Any]], str]:
+def load_embeddings_map(path: str) -> Dict[int, Dict[str, Any]]:
     import pickle
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Embeddings not found at {p}")
     with open(p, "rb") as f:
         data = pickle.load(f)
-    emb = np.asarray(data["embeddings"], dtype=np.float32)
     chunks = data["chunks"]
-    model_name = data["model_name"]
-    return emb, chunks, model_name
+    by_row = {int(ch.get("row_index", i)): ch for i, ch in enumerate(chunks)}
+    return by_row
 
+def load_results(file_path: str) -> List[Dict[str, Any]]:
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Data file not found: {p}")
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    results = data.get("results", data)
+    if not isinstance(results, list):
+        raise ValueError("Expected a list under 'results'.")
+    return results
 
-def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int) -> List[int]:
-    q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
-    m_norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12
-    m = matrix / m_norms
-    sims = (m @ q.reshape(-1, 1)).ravel()
-    if k >= len(sims):
-        return list(np.argsort(-sims))
-    idx = np.argpartition(-sims, k)[:k]
-    return list(idx[np.argsort(-sims[idx])])
-
-
-def build_blocks_from_refs(refs: List[Dict[str, Any]],
-                           by_row: Dict[int, Dict[str, Any]]) -> List[str]:
-    """Turn refined_refs (row_index, reference_label) into [REF i] blocks with FULL text."""
+def build_blocks_from_refs(refs: List[Dict[str, Any]], by_row: Dict[int, Dict[str, Any]]) -> List[str]:
     blocks: List[str] = []
     for i, r in enumerate(refs or [], start=1):
         ri = int(r.get("row_index", -1))
@@ -112,80 +90,124 @@ def build_blocks_from_refs(refs: List[Dict[str, Any]],
         blocks.append(f"[REF {i}] {label}\n{text}")
     return blocks
 
+def _extract_notification_id(label: str) -> str:
+    if not isinstance(label, str):
+        return ""
+    m = re.match(r"^\s*(\d+)", label)
+    return m.group(1) if m else label
 
-def build_blocks_fresh(CHUNKS: List[Dict[str, Any]], indices: List[int]) -> List[str]:
-    """Build FULL text blocks using fresh retrieval indices."""
-    blocks: List[str] = []
-    for i, idx in enumerate(indices, start=1):
-        ch = CHUNKS[int(idx)]
-        label = ch.get("reference_label") or f"row_{ch.get('row_index')}"
-        text = (ch.get("text") or "")
-        blocks.append(f"[REF {i}] {label}\n{text}")
-    return blocks
+def limit_refs(refs: List[Dict[str, Any]], top_k: int, dedup_by_notification: bool = True) -> List[Dict[str, Any]]:
+    """
+    Limit the list of refined refs to at most top_k, optionally deduplicating
+    by notification id parsed from reference_label. Preserves original order.
+    """
+    if not refs:
+        return []
+    out: List[Dict[str, Any]] = refs
+    if dedup_by_notification:
+        seen = set()
+        dedup: List[Dict[str, Any]] = []
+        for r in refs:
+            nid = _extract_notification_id(r.get("reference_label", ""))
+            if nid in seen:
+                continue
+            seen.add(nid)
+            dedup.append(r)
+        out = dedup
+    if isinstance(top_k, int) and top_k > 0:
+        out = out[:top_k]
+    return out
 
+def ensure_assistant_mask_capable_template(tok):
+    """
+    Ensure tokenizer chat template supports assistant-only loss masking
+    by providing {% generation %} markers. If missing, install a safe ChatML template.
+    """
+    def _has_generation_blocks(tpl: Any) -> bool:
+        return isinstance(tpl, str) and "{% generation %}" in tpl
 
-def load_generated_runs(paths: List[str]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for p in paths:
-        fp = Path(p)
-        if not fp.exists():
-            continue
-        with open(fp, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        results = data.get("results", data)
-        if isinstance(results, list):
-            rows.extend(results)
-    return rows
+    # If current template lacks generation markers, install a ChatML template with them.
+    if not _has_generation_blocks(getattr(tok, "chat_template", None)):
+        tok.chat_template = """{{- bos_token if bos_token else '' -}}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+<|im_start|>system
+{{ message['content'] }}<|im_end|>
+{%- elif message['role'] == 'user' -%}
+<|im_start|>user
+{{ message['content'] }}<|im_end|>
+{%- elif message['role'] == 'assistant' -%}
+<|im_start|>assistant
+{% generation %}{{ message['content'] }}{% endgeneration %}<|im_end|>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+<|im_start|>assistant
+{% generation %}{% endgeneration %}
+{%- endif -%}
+"""
+        if tok.eos_token is None or tok.eos_token != "<|im_end|>":
+            tok.add_special_tokens({"eos_token": "<|im_end|>"})
 
+    # Probe to verify mask-capability; support both newer and older Transformers.
+    probe = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    try:
+        tok.apply_chat_template(
+            probe,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_assistant_tokens_mask=True,
+            return_dict=True,
+        )
+    except TypeError:
+        # Older Transformers may not support return_dict; try without it.
+        try:
+            tok.apply_chat_template(
+                probe,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_assistant_tokens_mask=True,
+            )
+        except Exception:
+            pass
+    except Exception:
+        # If anything else goes wrong, we still return the tokenizer after template injection.
+        pass
+    return tok
 
-def is_refusal(answer: str) -> bool:
-    low = answer.strip().lower()
-    return any(key in low for key in REFUSAL_MATCH)
-
-
-# ======================= Data -> messages (FULL context) =======================
+# ======================= Data → messages (ALWAYS WITH CONTEXT) =======================
 def build_messages_examples(results: List[Dict[str, Any]],
                             tok,
-                            CHUNKS: List[Dict[str, Any]],
-                            EMB_MATRIX: np.ndarray,
-                            RETRIEVER: SentenceTransformer) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                            by_row: Dict[int, Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Build TRL 'messages' with FULL notifications. If a sample exceeds MAX_LENGTH,
-    we DO NOT trim. We collect it and either skip or error later.
-    Returns: (usable_examples, too_long_examples_report)
+    Build TRL 'messages' with FULL notifications from stored refined_refs.
+    No truncation: if tokenized example > MAX_SEQ_TOKENS, we skip or error.
     """
     examples: List[Dict[str, Any]] = []
     too_long: List[Dict[str, Any]] = []
 
-    by_row = {int(ch.get("row_index", i)): ch for i, ch in enumerate(CHUNKS)}
-
     for r in results:
-        q = (r.get("final_question") or r.get("draft_question") or r.get("question") or "").strip()
+        q = (r.get("final_question") or r.get("question") or r.get("draft_question") or "").strip()
         a = (r.get("final_answer") or r.get("answer") or "").strip()
-        if not q or not a:
+        refs = r.get("refined_refs") or []
+        # Apply top-k and optional de-duplication by notification id
+        refs = limit_refs(refs, REF_TOP_K, DEDUP_BY_NOTIFICATION)
+        if not q or not a or not refs:
+            # Always-with-context policy: skip samples without stored refined_refs
             continue
 
-        # If refusal, force EMPTY context so the behavior is trained clearly
-        if is_refusal(a):
-            blocks: List[str] = []
-        else:
-            # Prefer stored refined_refs to preserve citation alignment
-            refs = r.get("refined_refs")
-            if refs:
-                blocks = build_blocks_from_refs(refs, by_row)
-            else:
-                # Fallback: fresh retrieval with TOP_K (FULL text)
-                q_vec = np.asarray(RETRIEVER.encode([q], convert_to_tensor=False), dtype=np.float32)[0]
-                top_idx = cosine_topk(q_vec, EMB_MATRIX, TOP_K)
-                blocks = build_blocks_fresh(CHUNKS, top_idx)
-
+        blocks = build_blocks_from_refs(refs, by_row)
         context = "\n\n".join(blocks)
+
         user = (
             f"Context:\n{context}\n\n"
             f"Question: {q}\n"
             f"Answer concisely using only the context and include citations like [REF 1], [REF 2]."
         )
-
         sample = {
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -194,49 +216,38 @@ def build_messages_examples(results: List[Dict[str, Any]],
             ]
         }
 
-        # Token length check (FULL prompt incl. assistant) — no truncation here
         rendered = tok.apply_chat_template(sample["messages"], tokenize=False, add_generation_prompt=False)
         n_tok = len(tok.encode(rendered, add_special_tokens=False))
-
-        if n_tok > MAX_LENGTH:
+        if n_tok > MAX_SEQ_TOKENS:
             too_long.append({
                 "question": q,
                 "num_tokens": n_tok,
-                "max_length": MAX_LENGTH,
-                "has_refs": bool(r.get("refined_refs")),
-                "top_k": TOP_K,
+                "max_seq_tokens": MAX_SEQ_TOKENS,
                 "approx_chars": len(rendered),
+                "num_refs": len(refs),
             })
-            # Do not include in training set
         else:
             examples.append(sample)
 
     return examples, too_long
 
-
 # ======================= Model loading (QLoRA) =======================
-# --- in load_tokenizer_and_model() ---
-
 def load_tokenizer_and_model(model_dir: str):
     quant_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,  # fp16 compute to save RAM
+        bnb_4bit_compute_dtype=torch.float16,  # fp16 compute saves VRAM
     )
     tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    # >>> shard across both GPUs with headroom on GPU0
-    n_gpus = torch.cuda.device_count()
-    if n_gpus >= 2:
-        device_map = "balanced"  # better headroom for logits & inputs on GPU0
-        max_memory = {i: "19GiB" for i in range(n_gpus)}
-    else:
-        device_map = {"": 0}
-        max_memory = None
+    # Map the quantized model to a single GPU to avoid Accelerate relocating it
+    curr = torch.cuda.current_device() if torch.cuda.is_available() else 0
+    device_map = {"": curr}
+    max_memory = None
 
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
@@ -245,77 +256,50 @@ def load_tokenizer_and_model(model_dir: str):
         max_memory=max_memory,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-        attn_implementation="sdpa",  # if available, flash_attention_2 is better
+        attn_implementation="sdpa",  # stable on Windows; no extra installs
     )
-    model.config.use_cache = False  # needed with grad checkpointing
+    model.config.use_cache = False  # needed with gradient checkpointing
 
-    # QLoRA prep + adapters
+    # QLoRA adapters
     model = prepare_model_for_kbit_training(model)
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
+    lora_cfg = LoraConfig(
+        r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
         target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
     )
-    model = get_peft_model(model, lora_config)
-
-    # tiny extra: keep output head in fp16
-    try:
-        model.lm_head = model.lm_head.to(torch.float16)
-    except Exception:
-        pass
-
+    model = get_peft_model(model, lora_cfg)
     return tok, model
-
-
 
 # ======================= Train =======================
 def train():
-    # allocator hint (Windows may print a harmless warning if unsupported)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    
-    if not MULTI_GPU:
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-
     torch.backends.cuda.matmul.allow_tf32 = True
     assert_cuda()
 
-    # 1) Model
+    # 1) Model + tokenizer (and ensure template supports assistant-only loss)
     tok, model = load_tokenizer_and_model(BASE_MODEL_DIR)
+    tok = ensure_assistant_mask_capable_template(tok)
 
-    # 2) Data: load runs + embeddings for possible fresh retrieval
-    results = load_generated_runs(DATA_FILES)
-    if not results:
-        raise RuntimeError("No results found in DATA_FILES. Generate QA/IDK first.")
+    # 2) Data
+    results = load_results(DATA_FILE)
+    by_row = load_embeddings_map(EMBEDDINGS_PATH)
+    examples, too_long = build_messages_examples(results, tok, by_row)
 
-    EMB_MATRIX, CHUNKS, emb_model_name = load_embeddings_matrix(EMBEDDINGS_PATH)
-    RETRIEVER = SentenceTransformer(emb_model_name, device="cpu")
-
-    examples, too_long = build_messages_examples(results, tok, CHUNKS, EMB_MATRIX, RETRIEVER)
-
-    # Report long samples
     if too_long:
         Path(Path(OVERFLOW_REPORT).parent).mkdir(parents=True, exist_ok=True)
         with open(OVERFLOW_REPORT, "w", encoding="utf-8") as f:
             json.dump(too_long, f, indent=2)
-        msg = (f"{len(too_long)} samples exceed MAX_LENGTH={MAX_LENGTH} with FULL notifications. "
-               f"Details written to {OVERFLOW_REPORT}. "
-               f"Adjust TOP_K or edit the long samples and re-run.")
+        msg = f"{len(too_long)} samples exceed MAX_SEQ_TOKENS={MAX_SEQ_TOKENS}. See {OVERFLOW_REPORT}."
         if OVERFLOW_POLICY == "error":
             raise RuntimeError(msg)
         else:
             print("[WARN]", msg)
 
     if not examples:
-        raise RuntimeError("No usable training examples under the current MAX_LENGTH and TOP_K.")
+        raise RuntimeError("No usable training examples under current token budget (and context-only policy).")
 
     ds = Dataset.from_list(examples)  # TRL will apply chat template for 'messages'
 
-    # 3) Trainer config (SFTConfig)
-    # --- SFTConfig: use max_seq_length and the modern checkpointing kwarg ---
-
+    # 3) Trainer config
     sft_args = SFTConfig(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
@@ -327,35 +311,34 @@ def train():
         logging_steps=LOGGING_STEPS,
         save_steps=SAVE_STEPS,
         save_total_limit=SAVE_TOTAL_LIMIT,
-        bf16=False,                         # keep fp16 path consistent
+        bf16=False,  # stick to fp16 path for consistency with 4-bit compute
         gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},  # ↓ peak activations
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",
         report_to=None,
         seed=SEED,
 
-        # IMPORTANT: TRL uses max_seq_length (not max_length)
-        packing=False,                      # long-context safety; flip ON later if stable
+        # Important: TRL 0.21.0 uses `max_length` (not `max_seq_length`).
+        max_length=MAX_SEQ_TOKENS,
+        packing=PACKING,
         remove_unused_columns=True,
-        assistant_only_loss=False,          # keep false unless you add a gen-marked chat template
+        assistant_only_loss=True,   # now safe because we fixed the chat template
+        eos_token="<|im_end|>",
     )
-
 
     trainer = SFTTrainer(
         model=model,
         args=sft_args,
         train_dataset=ds,
-        processing_class=tok,  # tokenizer for chat template
+        processing_class=tok,
     )
 
     trainer.train()
 
-    # 4) Save LoRA adapters + tokenizer
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     trainer.model.save_pretrained(OUTPUT_DIR)
     tok.save_pretrained(OUTPUT_DIR)
     print(f"QLoRA training complete. Adapters saved to: {OUTPUT_DIR}")
-
 
 if __name__ == "__main__":
     train()
