@@ -59,9 +59,8 @@ raw_data/**/*.csv
 raw_data/**/*.pdf
 raw_data/**/*.doc
 raw_data/**/*.docx
-# Allow seed/config/context text files
-!raw_data/**/*.txt
-!raw_data/*.txt
+raw_data/**/*.txt
+raw_data/*.txt
 
 # Checkpoints / t!raw_data/**/*.jsonemporary files
 *.ckpt
