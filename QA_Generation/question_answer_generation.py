@@ -16,7 +16,7 @@ CONFIG = {
     "OUTPUTS_DIR": "outputs",
 
     # Dynamic sampling-driven generation
-    "SAMPLES_PER_RUN": 1000,
+    "SAMPLES_PER_RUN": 200, # 1000 for training, 200 for testing
     "SNIPPET_NUM_CHUNKS": 2,
     "SNIPPET_CHAR_BUDGET": 3000,
 

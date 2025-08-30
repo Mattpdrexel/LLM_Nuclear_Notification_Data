@@ -61,10 +61,14 @@ raw_data/**/*.doc
 raw_data/**/*.docx
 # Allow seed/config/context text files
 !raw_data/**/*.txt
-!raw_data/**/*.json
+!raw_data/*.txt
 
-# Checkpoints / temporary files
+# Checkpoints / t!raw_data/**/*.jsonemporary files
 *.ckpt
 *.tmp
 *.bak
 *.swp
+
+# Sensitive raw seeds and training docs (override earlier whitelists)
+raw_data/seeds.json
+raw_data/cw_training.txt
