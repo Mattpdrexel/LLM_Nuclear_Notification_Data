@@ -62,6 +62,9 @@ raw_data/**/*.docx
 raw_data/**/*.txt
 raw_data/*.txt
 
+# Presentation
+Presentation/
+
 # Checkpoints / t!raw_data/**/*.jsonemporary files
 *.ckpt
 *.tmp
