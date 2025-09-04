@@ -19,7 +19,7 @@ This repo builds a Retrieval-Augmented Generation (RAG) system over plant notifi
   ```
 - GPU notes:
   - PyTorch should match your CUDA runtime (this repo used CUDA 12.6 builds: `+cu126`).
-  - For large models, multi-GPU sharding is supported in generation scripts; training pins to a single GPU by default.
+  - Large models can be sharded across multiple GPUs for inference/eval; training (QLoRA) uses one GPU by default.
 
 ### 1) Build the embedding index
 - Source: Excel notifications (each DataFrame row becomes one full-text chunk).
@@ -64,8 +64,8 @@ Design notes:
 - Key settings:
   - LoRA rank (`r`): 16
   - Quantization: nf4, double-quant, compute fp16
-  - Assistant-only loss enabled via a chat template that marks assistant spans
-  - Always-with-context training: builds prompts from stored references
+  - Assistant-only loss enabled via a ChatML template that marks assistant spans
+  - Always-with-context training: builds prompts from stored refined_refs (FULL notifications)
   - Token budget gate to skip overly long samples (no hidden truncation)
 ```bash
 .\.venv\Scripts\python.exe Fine_Tuning\train_qlora.py
@@ -89,22 +89,42 @@ Two offline utilities in `Model_Testing/`:
   - Rebuilds full `[REF i]` blocks from `refined_refs` for each test item
   - Runs both systems (baseline vs fine-tuned) with identical context and budgets
   - Records latency, peak memory, citation metrics, and token-level F1 vs reference answers
+  - Supports auto multi‑GPU mapping (`device_map="balanced_low_0"`) when multiple GPUs are available
+  - Streams per‑sample results to `outputs/eval_reports/_stream_<system>.jsonl`
+  - Resumable: on restart, skips already processed indices when `RESUME_LATEST=True`
   ```bash
   .\.venv\Scripts\python.exe Model_Testing\fine_tune_vs_baseline.py
   ```
 
 - `judge_ab_with_llm.py`
   - Uses an offline judge LLM (`Qwen2.5-32B-Instruct-bnb-4bit`) to score A/B answers
-  - Writes an Excel (and CSV) report with judge scores and placeholders for human review
+  - Multi‑GPU judge: uses `device_map` across available GPUs with per‑GPU memory caps
+  - Streams judged rows to `outputs/eval_reports/llm_judge_stream.csv` for live progress
+  - Resumable: reads the stream CSV and continues from the next unjudged index
+  - Writes a final Excel report to `outputs/eval_reports/llm_judge_report.xlsx`
   ```bash
   .\.venv\Scripts\python.exe Model_Testing\judge_ab_with_llm.py
   ```
+
+### 6) Plot and summarize results
+- Script: `Model_Testing/plot_results.py`
+- Inputs:
+  - `outputs/eval_reports/llm_judge_report.xlsx` (judge scores and winners)
+  - Latest `outputs/eval_reports/eval_report_*.json` from `fine_tune_vs_baseline.py`
+- Outputs (to `outputs/eval_reports/plots/`):
+  - `judge_scores_bar.png`, `judge_winners_bar.png`, `token_f1_box.png`, `latency_vs_f1_scatter.png`
+  - `token_f1_box_eval.png`, `latency_box_eval.png`, `peak_mem_box_eval.png`, `cit_prec_box_eval.png`, `cit_recall_box_eval.png`
+  - Text summaries: `analysis_summary.txt` (judge) and `analysis_summary_eval.txt` (baseline vs qlora eval)
+```bash
+.\.venv\Scripts\python.exe Model_Testing\plot_results.py
+```
 
 ### Implementation notes & policies
 - Embeddings: one vector per notification; no mixing training text into the same index.
 - RAG: cosine similarity over normalized embeddings, with `[REF i]` blocks preserved for citations.
 - Context: scripts default to using full notification bodies and will deduplicate or cap refs where appropriate during evaluation.
 - Robustness: generation scripts incrementally checkpoint JSON outputs to survive interruptions.
+  - Evaluation scripts stream results and can resume from prior outputs.
 
 ### Data and repo hygiene
 - Raw materials like `raw_data/seeds.json` and `raw_data/cw_training.txt` are ignored by Git.
