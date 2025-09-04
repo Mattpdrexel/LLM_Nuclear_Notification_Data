@@ -38,9 +38,18 @@ CONFIG = {
 
     # Runtime
     "USE_SDPA": True,               # good on Windows; no flash-attn install needed
-    "DEVICE": 0,                    # pin to GPU 0; both systems are run sequentially
+    "DEVICE": 0,                    # default single-GPU device id
+    "AUTO_MULTI_GPU": True,         # auto shard across both GPUs when available
+    "GPU_MAX_MEMORY_GIB": 19,       # per-GPU cap when sharding
     "OUTPUT_DIR": r"outputs/eval_reports",
     "SYSTEM_PROMPT": "You are a domain expert assistant. Use ONLY the provided notifications.",
+
+    # Summarization of latest eval report (side-by-side Q/A)
+    "SUMMARY_OUTPUT_CSV": r"outputs/eval_reports/latest_qa_comparison.csv",
+    "SUMMARY_MAX_ROWS": 50,  # preview rows to print in console (set 0 to skip printing)
+
+    # Resume behavior
+    "RESUME_LATEST": True,          # if a prior eval_report_*.json exists, continue into it
 }
 
 # ======================= Utilities: IO & retrieval =======================
@@ -174,11 +183,19 @@ def load_model_and_tokenizer(base_dir: str, adapter_dir: Optional[str], device: 
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    device_map = {"": device}
+    # Device mapping: shard over multiple GPUs if available and requested
+    n = torch.cuda.device_count()
+    if CONFIG.get("AUTO_MULTI_GPU", True) and n >= 2:
+        device_map = "balanced_low_0"
+        max_memory = {i: f"{CONFIG.get('GPU_MAX_MEMORY_GIB', 19)}GiB" for i in range(n)}
+    else:
+        device_map = {"": device}
+        max_memory = None
     model = AutoModelForCausalLM.from_pretrained(
         base_dir,
         quantization_config=quant_cfg,
         device_map=device_map,
+        max_memory=max_memory,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
         attn_implementation=("sdpa" if CONFIG["USE_SDPA"] else None),
@@ -285,7 +302,7 @@ def run_system(
         f1 = f1_token_overlap(pred, ref_answer)
         cm = citation_metrics(pred, allowed_refs, r.get("final_references"))
 
-        per_sample.append({
+        record = {
             "idx": i - 1,
             "question": q,
             "reference_answer": ref_answer,
@@ -296,7 +313,18 @@ def run_system(
             **cm,
             "allowed_refs": allowed_refs,
             "expected_refs": r.get("final_references"),
-        })
+        }
+        per_sample.append(record)
+
+        # Streaming write/append to checkpoint file for this system
+        try:
+            ckpt_path = Path(CONFIG["OUTPUT_DIR"]) / f"_stream_{name}.jsonl"
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(ckpt_path, "a", encoding="utf-8") as f:
+                import json as _json
+                f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
         if i % 10 == 0:
             print(f"  [{name}] processed {i}/{len(eval_items)} ...")
@@ -330,12 +358,87 @@ def run_system(
 
     return report
 
+# ======================= Report summarization =======================
+def _latest_eval_report(dir_path: str) -> Path:
+    p = Path(dir_path)
+    cands = sorted(p.glob("eval_report_*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    if not cands:
+        raise FileNotFoundError(f"No eval_report_*.json found in {p}")
+    return cands[0]
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def summarize_report(report_path: Path, out_csv: Path, max_rows: int = 50) -> None:
+    obj = _read_json(report_path)
+    reports = obj.get("reports", [])
+    if len(reports) < 2:
+        print("[WARN] Expected two systems in report (baseline and fine-tuned). Skipping summary.")
+        return
+
+    sysA, sysB = reports[0], reports[1]
+    nameA = sysA.get("system_name", "system_A")
+    nameB = sysB.get("system_name", "system_B")
+    A = {d.get("idx"): d for d in sysA.get("details", [])}
+    B = {d.get("idx"): d for d in sysB.get("details", [])}
+
+    rows: List[Dict[str, Any]] = []
+    idxs = sorted(set(A.keys()) & set(B.keys()))
+    for i in idxs:
+        a, b = A[i], B[i]
+        rows.append({
+            "idx": i,
+            "question": a.get("question") or b.get("question"),
+            "gold_answer": a.get("reference_answer"),
+            f"{nameA}__answer": a.get("predicted_answer"),
+            f"{nameB}__answer": b.get("predicted_answer"),
+            f"{nameA}__token_f1": a.get("token_f1"),
+            f"{nameB}__token_f1": b.get("token_f1"),
+            f"{nameA}__latency_sec": a.get("latency_sec"),
+            f"{nameB}__latency_sec": b.get("latency_sec"),
+            f"{nameA}__cit_prec": a.get("citation_precision"),
+            f"{nameB}__cit_prec": b.get("citation_precision"),
+        })
+
+    # Write CSV (no extra deps)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import csv
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
+            if rows:
+                w.writeheader()
+                w.writerows(rows)
+        print(f"Wrote comparison CSV: {out_csv}")
+    except Exception as e:
+        print(f"[WARN] Could not write CSV: {e}")
+
+    # Console preview
+    if max_rows and max_rows > 0:
+        preview = rows[:max_rows]
+        for r in preview:
+            q = (r.get("question") or "").strip()
+            print("\n=== idx:", r["idx"], "===")
+            print("Q:", (q[:240] + ("…" if len(q) > 240 else "")))
+            print(f"{nameA}:", (str(r.get(f"{nameA}__answer") or "").strip()[:240] + ("…" if len(str(r.get(f"{nameA}__answer") or "")) > 240 else "")))
+            print(f"{nameB}:", (str(r.get(f"{nameB}__answer") or "").strip()[:240] + ("…" if len(str(r.get(f"{nameB}__answer") or "")) > 240 else "")))
+
 def main():
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.backends.cuda.matmul.allow_tf32 = True
 
     cfg = CONFIG
     Path(cfg["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
+
+    # 0) Determine resume mode
+    latest_report_path = None
+    if cfg.get("RESUME_LATEST", True):
+        try:
+            latest_report_path = _latest_eval_report(cfg["OUTPUT_DIR"])
+            print(f"[resume] Found latest report: {latest_report_path}")
+        except Exception:
+            latest_report_path = None
 
     # 1) Load eval set + embeddings map (for full-context blocks)
     eval_items = load_eval_results(cfg["EVAL_FILE"])
@@ -355,17 +458,43 @@ def main():
     ]
 
     all_reports = []
+
+    # If resuming and a combined report exists, prefer continuing by skipping idx that already exist
+    skip_idxs_by_system = {}
+    if latest_report_path is not None:
+        try:
+            prev = _read_json(latest_report_path)
+            for sys_rep in prev.get("reports", []):
+                name = sys_rep.get("system_name")
+                seen = {int(d.get("idx")) for d in sys_rep.get("details", []) if d.get("idx") is not None}
+                skip_idxs_by_system[name] = seen
+            print({k: len(v) for k, v in skip_idxs_by_system.items()})
+        except Exception:
+            skip_idxs_by_system = {}
+
     for s in systems:
+        name = s["name"]
+        if name in skip_idxs_by_system and skip_idxs_by_system[name]:
+            # Filter eval_items to only those not yet processed
+            remaining = []
+            for i, r in enumerate(eval_items):
+                if i not in skip_idxs_by_system[name]:
+                    remaining.append(r)
+            print(f"[{name}] Resuming: {len(remaining)} remaining out of {len(eval_items)}")
+            items = remaining
+        else:
+            items = eval_items
+
         rep = run_system(
-            s["name"],
+            name,
             cfg["BASE_MODEL_DIR"],
             s["adapter"],
-            eval_items,
+            items,
             by_row,
             retriever,
             cfg,
         )
-        print(f"\n[{s['name']}] Aggregate metrics:")
+        print(f"\n[{name}] Aggregate metrics:")
         for k, v in rep["metrics"].items():
             print(f"  {k}: {v:.4f}")
         all_reports.append(rep)
@@ -376,6 +505,13 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"config": cfg, "reports": all_reports}, f, indent=2, ensure_ascii=False)
     print(f"\nSaved evaluation report to: {out_path}")
+
+    # 4) Summarize latest report (including just-created one)
+    try:
+        latest = _latest_eval_report(cfg["OUTPUT_DIR"])
+        summarize_report(latest, Path(cfg["SUMMARY_OUTPUT_CSV"]), cfg.get("SUMMARY_MAX_ROWS", 50))
+    except Exception as e:
+        print(f"[WARN] Summary step skipped: {e}")
 
 if __name__ == "__main__":
     main()

@@ -33,10 +33,10 @@ CONFIG = {
 
     # ---- Judge model (local, offline) ----
     "JUDGE_MODEL_DIR": r"D:\huggingface\hub\Qwen2.5-32B-Instruct-bnb-4bit",
-    "JUDGE_DEVICE_MAP": "balanced_low_0",  # shard across 2×20GB
+    "JUDGE_DEVICE_MAP": "auto",  # should use all available GPUs
     "JUDGE_MAX_MEMORY_GB": 19,             # per GPU cap
     "JUDGE_MAX_NEW_TOKENS": 384,
-    "JUDGE_TEMPERATURE": 0.0,
+    "JUDGE_TEMPERATURE": 0.2, # Needs to be positive
     "JUDGE_TOP_P": 0.9,
     "JUDGE_SYSTEM_PROMPT": (
         "You are a meticulous evaluation assistant. Judge the two answers strictly using ONLY the provided context "
@@ -51,6 +51,10 @@ CONFIG = {
     # ---- Output ----
     "OUTPUT_XLSX": r"outputs/eval_reports/llm_judge_report.xlsx",
     "ALSO_WRITE_CSV": True,           # fallback CSV for very large cells
+    # Streaming/resume
+    "STREAM_CSV": r"outputs/eval_reports/llm_judge_stream.csv",
+    "RESUME": True,
+    "PRINT_EVERY": 10,
 }
 
 # ============================ IO utils ============================
@@ -142,6 +146,7 @@ def load_judge(model_dir: str, device_map: str, max_mem_gb: int):
     tok.padding_side = "right"
 
     # shard across both GPUs for capacity
+    # Use all available GPUs with per-GPU memory caps
     max_memory = {i: f"{max_mem_gb}GiB" for i in range(torch.cuda.device_count())} if torch.cuda.is_available() else None
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
@@ -211,8 +216,16 @@ def _safe_json_extract(text: str) -> Optional[Dict[str, Any]]:
 
 def judge_once(prompt: str, tok, model, max_new_tokens: int, temperature: float, top_p: float) -> Dict[str, Any]:
     dev = next(model.parameters()).device
+    print("[judge] Tokenizing prompt…", flush=True)
+    t0 = time.perf_counter()
     inputs = tok(prompt, return_tensors="pt")
+    print(f"[judge] Tokenized: input_ids={inputs['input_ids'].shape} in {time.perf_counter()-t0:.2f}s", flush=True)
+    print(f"[judge] Moving tensors to device: {dev}", flush=True)
+    t1 = time.perf_counter()
     inputs = {k: v.to(dev) for k, v in inputs.items()}
+    print(f"[judge] Moved to device in {time.perf_counter()-t1:.2f}s", flush=True)
+    print(f"[judge] Generating (max_new_tokens={max_new_tokens}, temp={temperature}, top_p={top_p})…", flush=True)
+    tg = time.perf_counter()
     with torch.no_grad():
         out_ids = model.generate(
             **inputs,
@@ -223,7 +236,10 @@ def judge_once(prompt: str, tok, model, max_new_tokens: int, temperature: float,
             pad_token_id=getattr(tok, "pad_token_id", tok.eos_token_id),
             use_cache=False,
         )
+    gen_s = time.perf_counter()-tg
+    print(f"[judge] Generation finished in {gen_s:.2f}s; decoding…", flush=True)
     text = tok.decode(out_ids[0, inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
+    print(f"[judge] Decoded {len(text)} chars.", flush=True)
     del inputs, out_ids
     gc.collect()
     if torch.cuda.is_available():
@@ -268,7 +284,35 @@ def main():
     tok_j, judge = load_judge(cfg["JUDGE_MODEL_DIR"], cfg["JUDGE_DEVICE_MAP"], cfg["JUDGE_MAX_MEMORY_GB"])
 
     rows = []
+    # Resume: load existing stream CSV to skip judged idx
+    judged_idx = set()
+    if CONFIG.get("RESUME", True):
+        try:
+            import csv
+            p = Path(CONFIG["STREAM_CSV"])
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        try:
+                            judged_idx.add(int(row.get("idx")))
+                        except Exception:
+                            pass
+                print(f"[resume] Loaded {len(judged_idx)} previously judged rows from stream CSV")
+        except Exception as e:
+            print(f"[WARN] Could not read stream CSV: {e}")
+    # Prepare stream CSV writer (append-safe)
+    stream_path = Path(CONFIG["STREAM_CSV"])
+    stream_path.parent.mkdir(parents=True, exist_ok=True)
+    stream_file = open(stream_path, "a", newline="", encoding="utf-8")
+    import csv as _csv
+    stream_writer = None
+    wrote_header = stream_path.exists() and stream_path.stat().st_size > 0
+
     for idx, item in enumerate(test_items):
+        print(f"[loop] idx={idx} starting", flush=True)
+        if idx in judged_idx:
+            continue
         if idx not in A or idx not in B:
             # was likely skipped by one of the systems; ignore in judge pass
             continue
@@ -287,15 +331,18 @@ def main():
         ansA = A[idx]["predicted_answer"]
         ansB = B[idx]["predicted_answer"]
 
+        print("[loop] building prompt", flush=True)
         prompt = judge_prompt(
             cfg["JUDGE_SYSTEM_PROMPT"], q, context, gold, ansA, ansB, item.get("final_references"), tok_j
         )
+        print("[loop] calling judge_once", flush=True)
         result = judge_once(
             prompt, tok_j, judge, cfg["JUDGE_MAX_NEW_TOKENS"], cfg["JUDGE_TEMPERATURE"], cfg["JUDGE_TOP_P"]
         )
+        print("[loop] judge_once returned", flush=True)
 
         # Assemble row for Excel (plus placeholders for human review)
-        rows.append({
+        out_row = {
             "idx": idx,
             "question": q,
             "gold_answer": gold,
@@ -337,10 +384,26 @@ def main():
             "human_correct_B": "",         # Y/N
             "human_preference": "",        # baseline/finetuned/tie
             "human_notes": "",
-        })
+        }
+        rows.append(out_row)
+        print(f"[loop] wrote idx={idx} to memory and stream", flush=True)
 
-        if (idx + 1) % 10 == 0:
+        # Stream append
+        try:
+            if stream_writer is None:
+                stream_writer = _csv.DictWriter(stream_file, fieldnames=list(out_row.keys()))
+                if not wrote_header:
+                    stream_writer.writeheader()
+                    wrote_header = True
+            stream_writer.writerow(out_row)
+            stream_file.flush()
+        except Exception as e:
+            print(f"[WARN] Streaming CSV write failed at idx {idx}: {e}")
+
+        if (idx + 1) % CONFIG.get("PRINT_EVERY", 10) == 0:
             print(f"Judged {idx + 1}/{len(test_items)} samples...")
+
+    stream_file.close()
 
     # 4) Write Excel (with CSV fallback)
     df = pd.DataFrame(rows)
